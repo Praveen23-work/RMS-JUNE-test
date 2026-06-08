@@ -29,7 +29,7 @@ esp_err_t init_log_system(void);
 esp_err_t write_log_entry(const char *log_data);
 
 size_t get_prev_log_offset();
-
+size_t get_max_log_size(void);
 /**
  * @brief Read and print all log entries.
  *

@@ -13,17 +13,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include <errno.h>
 
 #include "GSM_handler.h"
 
 #define LOG_TAG "LOG_MANAGER"
 
-static FILE *log_file = NULL;
+// static FILE *log_file = NULL;
 
 // static size_t max_log_file_size = 0xC40000; // 12 MB safe limit
 // static size_t max_log_file_size = 0x2C0000; // ~2.75 MB — leaves 190KB headroom on 2.94MB SPIFFS
-static size_t max_log_file_size = 0xB00000; // 11 MB — safe on 12.75 MB partition
-/*RMS: ~20,200 logs → 14.1 days offline at 1 log/min*/
+// static size_t max_log_file_size = 0xB00000; // 11 MB — safe on 12.75 MB partition
+static size_t max_log_file_size = 0x800000; // 8 MB safe default until init reads actual
+
 
 esp_err_t init_log_system()
 {
@@ -42,18 +44,27 @@ esp_err_t init_log_system()
     }
 
     size_t total = 0, used = 0;
-
     esp_spiffs_info("storage", &total, &used);
     ESP_LOGI(LOG_TAG, "SPIFFS: total=%d, used=%d", total, used);
 
-    // Create file if not exists
-    log_file = fopen(log_file_path, "a+");
-    if (!log_file)
+    /* Dynamic limit: 85% of actual usable SPIFFS space.
+     * Hardcoded 0xB00000 exceeded real usable space causing ENOSPC. */
+    max_log_file_size = (size_t)(total * 85 / 100);
+    ESP_LOGW(LOG_TAG, "max_log_file_size set to %zu bytes (85%% of %zu SPIFFS total)",
+             max_log_file_size, total);
+
+    /* Create file if not exists using r+b to avoid append mode bugs */
+    FILE *f = fopen(log_file_path, "r+b");
+    if (!f)
     {
-        ESP_LOGE(LOG_TAG, "Failed to open log file");
-        return ESP_FAIL;
+        f = fopen(log_file_path, "wb");
+        if (!f)
+        {
+            ESP_LOGE(LOG_TAG, "Failed to create log file errno=%d", errno);
+            return ESP_FAIL;
+        }
     }
-    fclose(log_file);
+    fclose(f);
     return ESP_OK;
 }
 
@@ -272,59 +283,92 @@ size_t get_prev_log_offset()
 
 esp_err_t write_log_entry(const char *new_log)
 {
-    // ESP_LOGI(LOG_TAG, "Starting write_log_entry");
+    size_t new_log_len = strlen(new_log) + 1; // +1 for '\n'
+    size_t file_size   = get_file_size();
 
-    size_t new_log_len = strlen(new_log) + 1; // Include newline
-    size_t file_size = get_file_size();
+    ESP_LOGI(LOG_TAG, "Log entry length: %d, current file size: %d",
+             new_log_len, file_size);
 
-    ESP_LOGI(LOG_TAG, "Log entry length: %d, current file size: %d", new_log_len, file_size);
-
-    // Enters condition once the file is FULL
     if (file_size + new_log_len >= max_log_file_size)
     {
-        size_t space_left = max_log_file_size - curr_log_offset;
-
-        // Check if there is space to delete some logs and make space for new entry
-        if (space_left < new_log_len)
-        {
-            curr_log_offset = 0; // Reset offset if file size exceeds limit
-            ESP_LOGW(LOG_TAG, "Log file full. Attempting to remove oldest entries.");
-        }
-
-        ESP_LOGW(LOG_TAG, "Cannot write log entry, file size exceeds limit");
-        // delete_log_lines_and_check_space(curr_log_offset, new_log_len);
-        
-        // log_file = fopen(log_file_path, "r+");
-        // fseek(log_file, curr_log_offset, SEEK_SET); // Start writing from the last known position
-        fclose(log_file);
+        ESP_LOGW(LOG_TAG, "Log file at limit (%zu >= %zu) — erasing and restarting.",
+                 file_size, max_log_file_size);
         erase_logs();
-        set_post_status(0,false,false); // Reset failed offset on full wrap
-        ESP_LOGE(LOG_TAG, "ERASED , RESTARTING ...............");
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        set_post_status(0, false, false);
+        vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
     }
-    else
+
+    /* Use r+b + fseek instead of "a" — avoids SPIFFS page boundary append bug */
+    FILE *f = fopen(log_file_path, "r+b");
+    if (!f)
     {
-        log_file = fopen(log_file_path, "a");
+        f = fopen(log_file_path, "wb");
+        if (!f)
+        {
+            ESP_LOGE(LOG_TAG, "fopen failed errno=%d — log NOT written", errno);
+            return ESP_FAIL;
+        }
     }
 
-   
-
-    if (!log_file)
+    if (fseek(f, 0, SEEK_END) != 0)
     {
-        ESP_LOGE(LOG_TAG, "Failed to open log file in append mode");
+        ESP_LOGE(LOG_TAG, "fseek to EOF failed errno=%d", errno);
+        fclose(f);
         return ESP_FAIL;
     }
 
+    size_t to_write = strlen(new_log);
+    size_t wrote    = fwrite(new_log, 1, to_write, f);
+    if (wrote != to_write)
+    {
+        ESP_LOGE(LOG_TAG, "fwrite body failed: wrote=%d expected=%d errno=%d",
+                 wrote, to_write, errno);
+        fclose(f);
+        if (errno == ENOSPC)
+        {
+            ESP_LOGE(LOG_TAG, "ENOSPC — formatting SPIFFS and restarting");
+            format_spiffs();
+            set_post_status(0, false, false);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
+        }
+        return ESP_FAIL;
+    }
 
-    fprintf(log_file, "%s\n", new_log);      // ESP_LOGI(LOG_TAG, "Log entry written: %s", entry);
-    fclose(log_file);
+    if (fwrite("\n", 1, 1, f) != 1)
+    {
+        ESP_LOGE(LOG_TAG, "fwrite newline failed errno=%d", errno);
+        fclose(f);
+        return ESP_FAIL;
+    }
 
-    prev_log_offset = curr_log_offset;  // Store previous offset
-    // verify_failed_offset(new_log_len);  // Check if failed offset overwritten
-    curr_log_offset += new_log_len;     // Update current log offset
-    ESP_LOGI(LOG_TAG, "Log Entry Written successfully");
-    ESP_LOGI(LOG_TAG, "prev_log_offset: %zu | curr_log_offset: %zu", prev_log_offset, curr_log_offset);
+    if (fflush(f) != 0)
+    {
+        ESP_LOGE(LOG_TAG, "fflush failed errno=%d", errno);
+        fclose(f);
+        return ESP_FAIL;
+    }
+
+    fclose(f);
+
+    size_t new_size = get_file_size();
+    if (new_size <= file_size)
+    {
+        ESP_LOGE(LOG_TAG,
+                 "SPIFFS size did not advance (before=%zu after=%zu) — formatting",
+                 file_size, new_size);
+        format_spiffs();
+        set_post_status(0, false, false);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
+    }
+
+    prev_log_offset = curr_log_offset;
+    curr_log_offset = new_size;
+
+    ESP_LOGI(LOG_TAG, "prev_log_offset: %zu | curr_log_offset: %zu | file_size: %zu",
+             prev_log_offset, curr_log_offset, new_size);
     return ESP_OK;
 }
 
@@ -332,7 +376,7 @@ esp_err_t write_log_entry(const char *new_log)
 
 void print_all_logs()
 {
-    log_file = fopen(log_file_path, "r");
+    FILE *log_file = fopen(log_file_path, "r");
     if (!log_file)
     {
         ESP_LOGE(LOG_TAG, "Unable to open log file for reading");
@@ -351,7 +395,7 @@ void print_all_logs()
 
 void print_all_logs_timestamp()
 {
-    log_file = fopen(log_file_path, "r");
+    FILE *log_file = fopen(log_file_path, "r");
     if (!log_file)
     {
         ESP_LOGE(LOG_TAG, "Unable to open log file for reading");
@@ -390,14 +434,23 @@ void print_all_logs_timestamp()
 
 
 
-void erase_logs()
+void erase_logs(void)
 {
-    log_file = fopen(log_file_path, "w");
-    if (log_file) {
-        fclose(log_file); // Opening in "w" mode truncates the file
-        ESP_LOGI("SPIFFS", "File %s cleared", log_file_path);
-    } else {
-        ESP_LOGE("SPIFFS", "Failed to open file %s for clearing", log_file_path);
+    FILE *f = fopen(log_file_path, "wb");
+    if (f)
+    {
+        fclose(f);
+        curr_log_offset = 0;
+        prev_log_offset = 0;
+        ESP_LOGI("SPIFFS", "Log file cleared: %s", log_file_path);
+    }
+    else
+    {
+        ESP_LOGW("SPIFFS", "Could not open %s for clearing (errno=%d) — "
+                 "may not exist yet after format",
+                 log_file_path, errno);
+        curr_log_offset = 0;
+        prev_log_offset = 0;
     }
 }
 

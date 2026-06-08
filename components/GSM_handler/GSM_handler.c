@@ -1036,16 +1036,21 @@ static void save_posted_log(const char *log_line) {
 }
 
 
-void clear_posted_logs(void) {
-    FILE *file = fopen(posted_log_file_path, "w"); // open in write mode to truncate
-    if (!file) {
-        ESP_LOGE("POST_LOG", "Failed to clear posted logs file");
-        return;
+void clear_posted_logs(void)
+{
+    FILE *f = fopen(posted_log_file_path, "wb");
+    if (f)
+    {
+        fclose(f);
+        posted_log_count = 0;
+        ESP_LOGI("POST_LOG", "Posted logs cleared");
     }
-    fclose(file);
-
-    posted_log_count = 0;
-    ESP_LOGI("POST_LOG", "Posted logs cleared");
+    else
+    {
+        ESP_LOGW("POST_LOG", "Could not clear posted logs (errno=%d) — "
+                 "normal after fresh format", errno);
+        posted_log_count = 0;
+    }
 }
 
 // Print all posted logs
@@ -1322,17 +1327,28 @@ post_status_t try_post_from_failed(size_t start_offset, bool is_wifi_post)
     if (post_offset == start_offset) {
         drain_total = 0;   /* new drain session starting from top */
     }
+    /* Line-aligned realign: read whole lines until we find one starting with '{'.
+    * Byte-by-byte scan can land on '{' inside a JSON value, pointing mid-entry. */
     while (1) {
-        c = fgetc(fp);
-        if (c == EOF) {
-            save_state_if_changed(curr_log_offset, false, false);
+        long line_start = ftell(fp);
+        if ((size_t)line_start >= curr_log_offset) {
             fclose(fp);
+            save_state_if_changed(curr_log_offset, false, false);
             return no_failed_data;
         }
-        if (c == '{') {
-            fseek(fp, -1, SEEK_CUR);
+        if (!fgets(line, sizeof(line), fp)) {
+            fclose(fp);
+            save_state_if_changed(curr_log_offset, false, false);
+            return no_failed_data;
+        }
+        if (line[0] == '{') {
+            /* Valid line start — rewind to line_start for the main loop */
+            fseek(fp, (long)line_start, SEEK_SET);
+            post_offset = (size_t)line_start;
             break;
         }
+        ESP_LOGW("TRY_FAILED", "Realign: skipping non-JSON line at offset %zu",
+                (size_t)line_start);
     }
 
     post_offset = ftell(fp);
@@ -1488,10 +1504,25 @@ post_status_t check_and_try_failed(bool is_wifi_post)
 
 void set_failed_offset(size_t failed_off)
 {
-    is_failed = true;
+    size_t actual_file_size = get_file_size();
+
+    /* curr_log_offset now always equals file_size after write_log_entry fix.
+     * If failed_off still exceeds file_size, the log write actually failed —
+     * anchor to real EOF to avoid seeking mid-log on next drain. */
+    if (actual_file_size > 0 && failed_off > actual_file_size)
+    {
+        ESP_LOGW("SET_FAILED",
+                 "failed_offset %zu > file_size %zu — clamping to file_size",
+                 failed_off, actual_file_size);
+        failed_off = actual_file_size;
+    }
+
+    is_failed     = true;
     failed_offset = failed_off;
-    post_wrap = false;
+    post_wrap     = false;
     save_post_state_blob(failed_offset, post_wrap, is_failed);
+    ESP_LOGW("SET_FAILED", "failed_offset set to %zu (file_size=%zu)",
+             failed_offset, actual_file_size);
 }
 
 size_t get_failed_offset()

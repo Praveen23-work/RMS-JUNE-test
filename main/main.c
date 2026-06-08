@@ -31,6 +31,7 @@
 #include "main.h"
 #include "support.h"
 #include <time.h>
+#include <sys/time.h>
 
 #include "driver/periph_ctrl.h"
 #include "esp_private/periph_ctrl.h"
@@ -1122,11 +1123,30 @@ static void try_gsm_ntp_sync(void)
     struct tm ist_t;
     gmtime_r(&ist_epoch, &ist_t);   /* break IST epoch into IST H:M:S */
 
+	/* 1. Update physical RTC (MCP7941x via I2C) with IST */
     set_rtc_time(ist_t.tm_mday, ist_t.tm_wday,
                  ist_t.tm_mon, ist_t.tm_year,
                  ist_t.tm_hour, ist_t.tm_min, ist_t.tm_sec);
 
-
+	
+	/* 2. Update ESP32 system time with UTC so time(NULL) is correct.
+     *    WiFi SNTP does this internally — GSM path must do it manually.
+     *    settimeofday takes UTC, TZ handles local conversion. */
+    struct timeval tv = {
+        .tv_sec  = utc_epoch,
+        .tv_usec = 0
+    };
+    if (settimeofday(&tv, NULL) != 0)
+    {
+        ESP_LOGW("GSM_NTP", "settimeofday failed");
+    }
+    else
+    {
+        /* Apply IST timezone so localtime_r() returns IST correctly */
+        setenv("TZ", "IST-5:30", 1);
+        tzset();
+        ESP_LOGI("GSM_NTP", "ESP32 system time updated via settimeofday");
+    }
 	/* keep unix_timestamp aligned with the corrected RTC */
     unix_timestamp = (int64_t)ist_epoch;
     /* Re-anchor scheduler so next DT slot aligns to corrected RTC */
